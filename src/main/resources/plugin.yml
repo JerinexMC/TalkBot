@@ -1,0 +1,13 @@
+name: TalkBot
+version: 0.1.0
+main: com.jerinex.talkbot.TalkBotPlugin
+api-version: '1.21'
+softdepend: [PvpBot]
+commands:
+  talkbot:
+    description: Manage TalkBot personalities
+    usage: /talkbot <bot> [style <style>|off|on|list]
+    permission: talkbot.admin
+permissions:
+  talkbot.admin:
+    default: op

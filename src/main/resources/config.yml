@@ -1,0 +1,18 @@
+# TalkBot - OpenAI-compatible chat API. Groq offers a free developer tier, subject to its limits.
+api:
+  base-url: "https://api.groq.com/openai/v1/chat/completions"
+  api-key: "PUT_YOUR_FREE_API_KEY_HERE"
+  model: "openai/gpt-oss-20b"
+  temperature: 0.85
+  max-tokens: 90
+chat:
+  reply-chance: 0.72
+  cooldown-seconds: 8
+  bot-chat-chance: 0.08
+  bot-chat-cooldown-seconds: 35
+  max-memory-messages: 12
+  max-reply-words: 24
+  ignore-commands: true
+combat:
+  react-chance: 0.65
+  cooldown-seconds: 5
