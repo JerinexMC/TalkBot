@@ -4,73 +4,135 @@ package com.jerinex.talkbot;
 import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Material;
-import org.bukkit.command.*;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
-import org.bukkit.event.*;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.inventory.ItemStack;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
+import java.util.concurrent.ThreadLocalRandom;
 
-public final class TalkBotPlugin extends JavaPlugin
-        implements Listener, CommandExecutor, TabCompleter {
+public final class TalkBotPlugin extends JavaPlugin implements Listener {
 
-    private static final Set<String> STYLES = Set.of(
-            "dry", "sus", "toxic", "chill",
-            "supernice", "brainrot", "chillbot1", "chillbot2"
-    );
+    private final Map<UUID, BotData> bots = new HashMap<>();
+    private final Map<UUID, Long> combatUntil = new HashMap<>();
+    private final Map<UUID, Long> lastSpotMessage = new HashMap<>();
+    private final Map<UUID, BukkitTask> pendingReplies = new HashMap<>();
 
-    private final Map<String, BotProfile> bots = new ConcurrentHashMap<>();
     private final Random random = new Random();
+
+    private static final String[] STYLES = {
+            "dry", "sus", "toxic", "chill", "supernice",
+            "brainrot", "chillbot1", "chillbot2"
+    };
+
+    private static final PlainTextComponentSerializer PLAIN =
+            PlainTextComponentSerializer.plainText();
+
+    private static final long SECOND = 1000L;
+
+    private static class BotData {
+        String name;
+        String style = "chill";
+        UUID conversationTarget;
+        long lastInteraction;
+        long lastSpoke;
+        long fatigueUntil;
+        int conversationLines;
+        final Deque<String> recentPhrases = new ArrayDeque<>();
+
+        BotData(String name) {
+            this.name = name;
+        }
+    }
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
-
-        PluginCommand command = Objects.requireNonNull(getCommand("talkbot"));
-        command.setExecutor(this);
-        command.setTabCompleter(this);
+        loadBots();
 
         Bukkit.getPluginManager().registerEvents(this, this);
 
-        if (getConfig().isConfigurationSection("registered-bots")) {
-            for (String name : getConfig().getConfigurationSection("registered-bots").getKeys(false)) {
-                String style = getConfig().getString("registered-bots." + name, "chill");
-
-                if (!STYLES.contains(style.toLowerCase(Locale.ROOT))) {
-                    style = "chill";
-                }
-
-                bots.put(key(name), new BotProfile(name, style));
-            }
-        }
-
+        // Periodic proximity awareness and occasional social behavior.
         Bukkit.getScheduler().runTaskTimer(
-                this,
-                this::maybeStartBotConversation,
-                200L,
-                200L
+                this, this::ambientTick, 200L, 200L
         );
 
-        getLogger().info("TalkBot enabled. Offline conversation engine loaded.");
+        getLogger().info("TalkBot enabled. Registered bots: " + bots.size());
     }
 
     @Override
     public void onDisable() {
-        saveProfiles();
-        bots.clear();
+        for (BukkitTask task : pendingReplies.values()) {
+            task.cancel();
+        }
+
+        saveBots();
     }
 
-    // =========================================================
-    // COMMANDS
-    // =========================================================
+    private void loadBots() {
+        if (!getConfig().isConfigurationSection("bots")) return;
+
+        for (String key : getConfig().getConfigurationSection("bots").getKeys(false)) {
+            try {
+                UUID id = UUID.fromString(key);
+                String name = getConfig().getString("bots." + key + ".name", "Unknown");
+                BotData data = new BotData(name);
+                data.style = getConfig().getString("bots." + key + ".style", "chill");
+
+                Player online = Bukkit.getPlayer(id);
+                if (online != null) {
+                    data.name = online.getName();
+                }
+
+                bots.put(id, data);
+            } catch (IllegalArgumentException ignored) {
+            }
+        }
+    }
+
+    private void saveBots() {
+        getConfig().set("bots", null);
+
+        for (Map.Entry<UUID, BotData> entry : bots.entrySet()) {
+            String path = "bots." + entry.getKey();
+            getConfig().set(path + ".name", entry.getValue().name);
+            getConfig().set(path + ".style", entry.getValue().style);
+        }
+
+        saveConfig();
+    }
+
+    private void registerBot(Player player) {
+        BotData data = bots.computeIfAbsent(
+                player.getUniqueId(), id -> new BotData(player.getName())
+        );
+
+        data.name = player.getName();
+        saveBots();
+
+        player.sendMessage("TalkBot: You are now registered as a bot.");
+    }
+
+    private void unregisterBot(Player player) {
+        bots.remove(player.getUniqueId());
+
+        BukkitTask task = pendingReplies.remove(player.getUniqueId());
+        if (task != null) task.cancel();
+
+        saveBots();
+        player.sendMessage("TalkBot: Bot registration disabled.");
+    }
 
     @Override
     public boolean onCommand(
@@ -79,1056 +141,924 @@ public final class TalkBotPlugin extends JavaPlugin
             String label,
             String[] args
     ) {
+        if (!command.getName().equalsIgnoreCase("talkbot")) return false;
+
         if (args.length == 0) {
-            sender.sendMessage("§e/talkbot <bot>");
-            sender.sendMessage("§e/talkbot <bot> style <style>");
-            sender.sendMessage("§e/talkbot <bot> off");
+            sender.sendMessage("§6TalkBot Commands:");
+            sender.sendMessage("§e/talkbot <player>");
+            sender.sendMessage("§e/talkbot <player> style <style>");
+            sender.sendMessage("§e/talkbot <player> off");
             sender.sendMessage("§e/talkbot list");
             return true;
         }
 
         if (args[0].equalsIgnoreCase("list")) {
+            sender.sendMessage("§6Registered TalkBots:");
+
             if (bots.isEmpty()) {
-                sender.sendMessage("§7No TalkBots registered.");
+                sender.sendMessage("§7No registered bots.");
                 return true;
             }
 
-            sender.sendMessage("§aRegistered TalkBots:");
-
-            for (BotProfile profile : bots.values()) {
-                sender.sendMessage("§f- " + profile.name + " §7(" + profile.style + ")");
+            for (Map.Entry<UUID, BotData> entry : bots.entrySet()) {
+                sender.sendMessage(
+                        "§e" + entry.getValue().name +
+                        " §7- " + entry.getValue().style
+                );
             }
-
             return true;
         }
 
-        String name = args[0];
-        String id = key(name);
+        Player target = Bukkit.getPlayerExact(args[0]);
 
-        if (args.length >= 2 && args[1].equalsIgnoreCase("off")) {
-            BotProfile removed = bots.remove(id);
-
-            getConfig().set("registered-bots." + name, null);
-            saveConfig();
-
-            sender.sendMessage(
-                    removed == null
-                            ? "§7That bot wasn't registered."
-                            : "§cTalkBot disabled for " + removed.name
-            );
-
+        if (target == null) {
+            sender.sendMessage("§cThat player is not online.");
             return true;
         }
 
-        if (args.length >= 2 && args[1].equalsIgnoreCase("style")) {
-            if (args.length < 3) {
-                sender.sendMessage("§cAvailable styles: " + String.join(", ", STYLES));
-                return true;
-            }
+        if (args.length == 1) {
+            registerBot(target);
+            return true;
+        }
 
+        if (args[1].equalsIgnoreCase("off")) {
+            unregisterBot(target);
+            return true;
+        }
+
+        if (args.length >= 3 && args[1].equalsIgnoreCase("style")) {
             String style = args[2].toLowerCase(Locale.ROOT);
 
-            if (!STYLES.contains(style)) {
-                sender.sendMessage("§cAvailable styles: " + String.join(", ", STYLES));
+            if (!Arrays.asList(STYLES).contains(style)) {
+                sender.sendMessage("§cStyles: " + String.join(", ", STYLES));
                 return true;
             }
 
-            BotProfile profile = bots.get(id);
+            BotData data = bots.get(target.getUniqueId());
 
-            if (profile == null) {
-                Player online = Bukkit.getPlayerExact(name);
-
-                if (online == null) {
-                    sender.sendMessage("§cSpawn the bot first, then register it.");
-                    return true;
-                }
-
-                profile = new BotProfile(online.getName(), style);
-                bots.put(key(online.getName()), profile);
-            } else {
-                profile.style = style;
+            if (data == null) {
+                sender.sendMessage("§cRegister that bot first.");
+                return true;
             }
 
-            saveProfiles();
+            data.style = style;
+            saveBots();
 
-            sender.sendMessage("§a" + profile.name + "'s personality is now " + style + ".");
+            sender.sendMessage("§a" + target.getName() + "'s style is now " + style);
             return true;
         }
-
-        Player player = Bukkit.getPlayerExact(name);
-
-        if (player == null) {
-            sender.sendMessage("§cI can't see " + name + " online. Spawn the PvpBot first.");
-            return true;
-        }
-
-        bots.put(key(player.getName()), new BotProfile(player.getName(), "chill"));
-        saveProfiles();
-
-        sender.sendMessage("§aTalkBot enabled for " + player.getName() + ".");
-        sender.sendMessage("§7Change its personality with /talkbot " + player.getName() + " style <style>");
 
         return true;
     }
 
-    @Override
-    public List<String> onTabComplete(
-            CommandSender sender,
-            Command command,
-            String alias,
-            String[] args
-    ) {
-        if (args.length == 1) {
-            List<String> result = new ArrayList<>();
-            result.add("list");
-
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                result.add(player.getName());
-            }
-
-            for (BotProfile profile : bots.values()) {
-                result.add(profile.name);
-            }
-
-            return result;
-        }
-
-        if (args.length == 2) {
-            return List.of("style", "off");
-        }
-
-        if (args.length == 3 && args[1].equalsIgnoreCase("style")) {
-            return new ArrayList<>(STYLES);
-        }
-
-        return Collections.emptyList();
-    }
-
-    // =========================================================
-    // CHAT LISTENER
-    // =========================================================
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onChat(AsyncChatEvent event) {
-        Player speaker = event.getPlayer();
-
-        String message = PlainTextComponentSerializer.plainText()
-                .serialize(event.message())
-                .trim();
-
+        String message = PLAIN.serialize(event.message()).trim();
         if (message.isEmpty()) return;
 
-        if (getConfig().getBoolean("chat.ignore-commands", true)
-                && message.startsWith("/")) {
-            return;
-        }
-
-        UUID uuid = speaker.getUniqueId();
-        String name = speaker.getName();
-        String content = message;
+        Player sender = event.getPlayer();
 
         Bukkit.getScheduler().runTask(this, () -> {
-            Player current = Bukkit.getPlayer(uuid);
+            if (!sender.isOnline()) return;
 
-            if (current == null) return;
-
-            if (isBot(name)) {
-                processBotConversation(name, content);
-            } else {
-                processPlayerMessage(name, content);
-            }
+            processChat(sender, message);
         });
     }
 
-    private void processPlayerMessage(String speaker, String original) {
-        String message = normalize(original);
+    private void processChat(Player sender, String message) {
+        boolean senderIsBot = bots.containsKey(sender.getUniqueId());
 
-        if (message.isBlank()) return;
+        for (Map.Entry<UUID, BotData> entry :
+                new ArrayList<>(bots.entrySet())) {
 
-        for (BotProfile profile : bots.values()) {
-            Player bot = Bukkit.getPlayerExact(profile.name);
+            Player bot = Bukkit.getPlayer(entry.getKey());
+            BotData data = entry.getValue();
 
-            if (bot == null) continue;
+            if (bot == null || !bot.isOnline() || bot.equals(sender)) continue;
 
-            profile.remember(speaker + ": " + original);
-
-            Decision decision = understand(profile, bot, speaker, message);
-
-            if (decision != null) {
-                scheduleReply(profile, decision.message, decision.delay);
-            }
-        }
-    }
-
-    private Decision understand(
-            BotProfile profile,
-            Player bot,
-            String speaker,
-            String message
-    ) {
-        boolean addressed = isAddressed(profile.name, message);
-
-        // Resource requests.
-        if (asksForResource(message)) {
-            String material = requestedMaterial(message);
-
-            if (material != null && hasMaterial(bot, material)) {
-                if (addressed || random.nextDouble() < 0.20) {
-                    int amount = countMaterial(bot, material);
-
-                    String reply = amount == 1
-                            ? "i got one " + pretty(material)
-                            : "i got " + amount + " " + pretty(material);
-
-                    return createDecision(profile, reply, 2, 8);
+            if (senderIsBot) {
+                // Bot-to-bot conversations are allowed, but not endless loops.
+                if (random.nextInt(100) < 28 &&
+                        bot.getLocation().distanceSquared(sender.getLocation()) <= 2500) {
+                    engage(bot, sender, message, data, false);
                 }
-            } else if (material != null && addressed) {
-                return createDecision(
-                        profile,
-                        choose(profile, new String[]{
-                                "nah im out of " + pretty(material),
-                                "dont got any rn",
-                                "i need some too",
-                                "sorry bro, no " + pretty(material)
-                        }),
-                        2,
-                        8
-                );
-            }
-        }
-
-        // Coordinate requests.
-        if (asksForCoordinates(message) && addressed) {
-            return createDecision(
-                    profile,
-                    "im at " + coordinates(bot),
-                    2,
-                    8
-            );
-        }
-
-        // Help offers.
-        if (offersHelp(message) && addressed) {
-            return createDecision(
-                    profile,
-                    "bet, im at " + coordinates(bot),
-                    3,
-                    9
-            );
-        }
-
-        // Ignore most messages not directed at this bot.
-        if (!addressed) {
-            if (isFunny(message) && random.nextDouble() < 0.08) {
-                return createDecision(profile, jokeReply(profile), 5, 15);
+                continue;
             }
 
-            if (isGreeting(message) && random.nextDouble() < 0.05) {
-                return createDecision(profile, greetingReply(profile), 5, 12);
+            double distance = bot.getLocation().distanceSquared(sender.getLocation());
+
+            // Normal conversation range: 50 blocks.
+            if (distance > 2500) continue;
+
+            boolean addressed = isAddressed(message, bot.getName());
+            boolean alreadyTalking =
+                    data.conversationTarget != null &&
+                    data.conversationTarget.equals(sender.getUniqueId()) &&
+                    System.currentTimeMillis() - data.lastInteraction < 30000;
+
+            if (alreadyTalking) {
+                data.lastInteraction = System.currentTimeMillis();
+                data.conversationLines++;
+
+                if (data.conversationLines >= 14) {
+                    data.fatigueUntil = System.currentTimeMillis()
+                            + randomBetween(25000, 55000);
+
+                    data.conversationTarget = null;
+                    data.conversationLines = 0;
+                    continue;
+                }
             }
 
-            if (random.nextDouble() < getConfig().getDouble(
-                    "chat.ambient-reply-chance", 0.01)) {
-                return createDecision(profile, ambientReply(profile), 8, 20);
+            if (System.currentTimeMillis() < data.fatigueUntil && !addressed) {
+                continue;
             }
 
-            return null;
-        }
+            if (addressed || alreadyTalking) {
+                engage(bot, sender, message, data, true);
+                continue;
+            }
 
-        // Direct conversation.
-        if (isGreeting(message)) {
-            return createDecision(profile, greetingReply(profile), 2, 8);
+            // Sometimes join nearby conversations naturally.
+            if (!isCombat(bot) && random.nextInt(100) < 9) {
+                engage(bot, sender, message, data, false);
+            }
         }
-
-        if (isHowAreYou(message)) {
-            return createDecision(profile, smallTalkReply(profile), 2, 8);
-        }
-
-        if (asksName(message)) {
-            return createDecision(profile, "im " + profile.name + " bro", 2, 7);
-        }
-
-        if (isInsult(message)) {
-            return createDecision(profile, insultReply(profile), 2, 8);
-        }
-
-        if (isFunny(message)) {
-            return createDecision(profile, jokeReply(profile), 2, 8);
-        }
-
-        if (isMinecraftQuestion(message)) {
-            return createDecision(
-                    profile,
-                    minecraftReply(profile, message),
-                    3,
-                    10
-            );
-        }
-
-        if (isOpinionQuestion(message)) {
-            return createDecision(
-                    profile,
-                    opinionReply(profile, message),
-                    3,
-                    10
-            );
-        }
-
-        return createDecision(
-                profile,
-                generalReply(profile, message),
-                3,
-                10
-        );
     }
 
-    private Decision createDecision(
-            BotProfile profile,
+    private void engage(
+            Player bot,
+            Player target,
             String message,
-            int minDelay,
-            int maxDelay
+            BotData data,
+            boolean direct
     ) {
-        long now = System.currentTimeMillis();
+        data.conversationTarget = target.getUniqueId();
+        data.lastInteraction = System.currentTimeMillis();
 
-        if (now - profile.lastSpokeAt
-                < getConfig().getLong("chat.cooldown-seconds", 5) * 1000L) {
-            return null;
+        if (data.conversationLines == 0) {
+            data.conversationLines = 1;
         }
 
-        int delay = minDelay + random.nextInt(maxDelay - minDelay + 1);
+        String reply = generateReply(bot, target, message, data, direct);
 
-        return new Decision(message, delay);
+        if (reply == null || reply.isBlank()) return;
+
+        boolean flowState = data.conversationLines >= 2 &&
+                System.currentTimeMillis() < data.fatigueUntil + 100000;
+
+        scheduleReply(bot, target, data, reply, flowState);
     }
-
-    // =========================================================
-    // BOT REPLIES
-    // =========================================================
 
     private void scheduleReply(
-            BotProfile profile,
-            String message,
-            int delay
+            Player bot,
+            Player target,
+            BotData data,
+            String reply,
+            boolean flowState
     ) {
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            Player bot = Bukkit.getPlayerExact(profile.name);
+        BukkitTask old = pendingReplies.remove(bot.getUniqueId());
+        if (old != null) old.cancel();
 
-            if (bot == null || !bots.containsKey(key(profile.name))) return;
+        long delay;
 
-            long now = System.currentTimeMillis();
+        if (flowState) {
+            delay = 0;
+        } else if (isCombat(bot)) {
+            // Combat replies are fast.
+            delay = randomBetween(4, 20);
+        } else {
+            // Normal replies: 1–5 seconds.
+            delay = randomBetween(20, 100);
+        }
 
-            if (now - profile.lastSpokeAt
-                    < getConfig().getLong("chat.cooldown-seconds", 5) * 1000L) {
+        BukkitTask task = Bukkit.getScheduler().runTaskLater(this, () -> {
+            pendingReplies.remove(bot.getUniqueId());
+
+            if (!bot.isOnline()) return;
+            if (!target.isOnline()) return;
+            if (!bots.containsKey(bot.getUniqueId())) return;
+
+            // Keep ordinary conversation within 50 blocks.
+            if (bot.getLocation().distanceSquared(target.getLocation()) > 2500) {
                 return;
             }
 
-            String reply = sanitize(message);
-
-            if (reply.isBlank()) return;
-
-            int max = getConfig().getInt("chat.max-message-characters", 160);
-
-            if (reply.length() > max) {
-                reply = reply.substring(0, max).trim();
-            }
-
-            profile.lastSpokeAt = now;
-            profile.remember(profile.name + ": " + reply);
-
-            try {
-                bot.chat(reply);
-            } catch (Throwable error) {
-                getLogger().warning("Could not make " + profile.name + " chat: " + error.getMessage());
-            }
-
-        }, Math.max(1, delay));
-    }
-
-    private String greetingReply(BotProfile p) {
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"yo", "wsp", "sup", "what"};
-            case "supernice" -> new String[]{"yooo what's good", "hey how you doing", "yo yo"};
-            case "brainrot" -> new String[]{"yooo twin", "wsp gang", "AYO", "what's good cuh"};
-            case "toxic" -> new String[]{"what you want", "yo", "wsp"};
-            case "sus" -> new String[]{"yo", "wsp", "why you calling me"};
-            case "chillbot1" -> new String[]{"yo bro", "wsp", "what's up"};
-            case "chillbot2" -> new String[]{"yooo", "ay what's good", "sup"};
-            default -> new String[]{"yo", "wsp", "yooo", "what's up", "sup"};
-        });
-    }
-
-    private String smallTalkReply(BotProfile p) {
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"im good", "fine", "chilling"};
-            case "supernice" -> new String[]{"im good bro, how about you", "doing pretty good"};
-            case "brainrot" -> new String[]{"im chilling twin", "we up", "still alive somehow"};
-            case "toxic" -> new String[]{"better than you probably", "im good"};
-            case "sus" -> new String[]{"im good bro why", "chilling, you?"};
-            default -> new String[]{"im good, you?", "chilling rn", "im alright", "can't complain"};
-        });
-    }
-
-    private String insultReply(BotProfile p) {
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"ok", "alright", "if you say so"};
-            case "supernice" -> new String[]{"damn what did i do to you", "ill let you have that one"};
-            case "toxic" -> new String[]{"you type more than you fight", "say that after you win one", "bro is brave in chat"};
-            case "brainrot" -> new String[]{"bro woke up and chose yap", "you got it twin", "crazy statement"};
-            case "sus" -> new String[]{"why you obsessed with me", "bro wants my attention"};
-            default -> new String[]{"bro what did i do", "alright man", "you good?"};
-        });
-    }
-
-    private String jokeReply(BotProfile p) {
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"...", "not bad", "i hate that i laughed"};
-            case "brainrot" -> new String[]{"HELP", "LMAOOO", "nah thats crazy", "BRO"};
-            case "sus" -> new String[]{"AYO pause", "nah you did not just say that", "sus"};
-            default -> new String[]{"LMAO", "nah thats funny", "bro", "HELP", "that was actually good"};
-        });
-    }
-
-    private String generalReply(BotProfile p, String msg) {
-        if (contains(msg, "fight", "1v1", "duel")) {
-            return choose(p, new String[]{"bet", "when", "what kit", "you first"});
-        }
-
-        if (contains(msg, "come here", "tp", "teleport")) {
-            return choose(p, new String[]{"where to", "what for", "gimme a sec", "coords?"});
-        }
-
-        if (contains(msg, "build", "building")) {
-            return choose(p, new String[]{"what are you building", "that could be cool", "lemme see when its done"});
-        }
-
-        if (contains(msg, "bored")) {
-            return choose(p, new String[]{"same, we should do something", "go start a war or something", "build something stupid"});
-        }
-
-        if (contains(msg, "help")) {
-            return choose(p, new String[]{"with what", "what happened", "what do you need"});
-        }
-
-        if (msg.contains("?")) {
-            return choose(p, new String[]{"maybe", "depends", "idk honestly", "probably", "what do you think"});
-        }
-
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"yeah", "maybe", "idk", "fair"};
-            case "supernice" -> new String[]{"oh fr? that's cool", "i got you", "yeah that makes sense"};
-            case "brainrot" -> new String[]{"twin what", "nah fr", "lowkey", "thats wild"};
-            case "toxic" -> new String[]{"you sure about that", "bold claim", "prove it"};
-            case "sus" -> new String[]{"ayo", "bro what", "thats kinda weird"};
-            case "chillbot1" -> new String[]{"fr", "yeah probably", "fair enough"};
-            case "chillbot2" -> new String[]{"lowkey true", "i get you", "real"};
-            default -> new String[]{"fr", "yeah probably", "fair enough", "lowkey true", "i get you"};
-        });
-    }
-
-    // =========================================================
-    // MINECRAFT KNOWLEDGE
-    // =========================================================
-
-    private String minecraftReply(BotProfile p, String msg) {
-        if (contains(msg, "best armor", "strongest armor")) {
-            return "netherite is the strongest normal armor tier, and protection enchants matter a lot";
-        }
-
-        if (contains(msg, "best sword", "strongest sword")) {
-            return "netherite sword with sharpness is the usual answer, depends on the pvp rules";
-        }
-
-        if (contains(msg, "diamond")) {
-            if (contains(msg, "what y", "which y", "best y", "where find")) {
-                return "around y -59 is the usual diamond mining level";
-            }
-
-            if (contains(msg, "how get", "where get", "find")) {
-                return "mine below y 16, around y -59 is usually good. fortune helps";
-            }
-        }
-
-        if (contains(msg, "iron") && contains(msg, "what y", "where find", "best y")) {
-            return "iron is common around y 16, and high mountains are good too";
-        }
-
-        if (contains(msg, "ancient debris")) {
-            return "around y 15 in the nether is the usual ancient debris level";
-        }
-
-        if (contains(msg, "netherite") && contains(msg, "craft", "make", "upgrade")) {
-            return "use a smithing table with a netherite upgrade template and a netherite ingot";
-        }
-
-        if (contains(msg, "elytra")) {
-            return "you can't craft elytra, find them on end ships";
-        }
-
-        if (contains(msg, "end crystal")) {
-            return "end crystals use glass, an eye of ender and a ghast tear";
-        }
-
-        if (contains(msg, "enchant")) {
-            return "you need an enchanting table, lapis and 15 bookshelves for level 30 enchants";
-        }
-
-        if (contains(msg, "warden", "wither", "ender dragon")) {
-            return "those bosses can get messy. bring good gear, food and a plan";
-        }
-
-        if (contains(msg, "crystal pvp", "cpvp")) {
-            return "crystal pvp is mostly timing, spacing and knowing when to place and break";
-        }
-
-        if (contains(msg, "mace")) {
-            return "mace damage scales with fall distance, wind charges make some nasty setups";
-        }
-
-        if (contains(msg, "totem")) {
-            return "totems save you from dying once, but watch out for the next hit";
-        }
-
-        if (contains(msg, "redstone", "farm")) {
-            return "depends on the farm. what are you trying to build?";
-        }
-
-        if (contains(msg, "villager")) {
-            return "villagers are useful for trading, just lock in the trades you actually need";
-        }
-
-        if (contains(msg, "pvp")) {
-            return choose(p, new String[]{
-                    "depends on the kit and version",
-                    "spacing and timing matter more than people think",
-                    "w tapping and strafing help a lot"
-            });
-        }
-
-        return choose(p, new String[]{
-                "depends on the version and server rules",
-                "yeah that's a Minecraft thing for sure",
-                "what part are you asking about?",
-                "there's a few ways to do that"
-        });
-    }
-
-    private String opinionReply(BotProfile p, String msg) {
-        if (contains(msg, "java or bedrock", "better java", "minecraft better")) {
-            return "java for pvp and servers, bedrock is nice for crossplay. depends what you grew up on";
-        }
-
-        if (contains(msg, "naruto", "anime")) {
-            return choose(p, new String[]{
-                    "naruto has some insane fights",
-                    "depends on the arc, some of it is peak",
-                    "i still think the character fights carry"
-            });
-        }
-
-        if (contains(msg, "football", "soccer")) {
-            return choose(p, new String[]{
-                    "football debates never end",
-                    "depends which team you're talking about",
-                    "who's your team?"
-            });
-        }
-
-        if (contains(msg, "basketball", "nba")) {
-            return choose(p, new String[]{
-                    "basketball takes get heated for no reason",
-                    "who's your favorite player?",
-                    "depends what era you're talking about"
-            });
-        }
-
-        return choose(p, new String[]{
-                "honestly depends",
-                "i can see both sides",
-                "nah i have a different take but go on",
-                "not sure yet"
-        });
-    }
-
-    private String ambientReply(BotProfile p) {
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"anyone on", "quiet server"};
-            case "brainrot" -> new String[]{"twin this server is quiet", "what are we doing gang"};
-            case "supernice" -> new String[]{"anyone need a hand with anything?", "hope everyone's doing good"};
-            default -> new String[]{"anyone doing anything", "what's everyone up to", "anyone wanna play"};
-        });
-    }
-
-    // =========================================================
-    // COMBAT CHAT REACTIONS
-    // =========================================================
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onDamage(EntityDamageByEntityEvent event) {
-        Player bot = asBot(event.getEntity());
-        boolean victim = bot != null;
-
-        if (bot == null) {
-            bot = asBot(event.getDamager());
-        }
-
-        if (bot == null) return;
-
-        BotProfile profile = bots.get(key(bot.getName()));
-        if (profile == null) return;
-
-        long now = System.currentTimeMillis();
-
-        if (now - profile.lastCombatAt
-                < getConfig().getLong("combat.cooldown-seconds", 5) * 1000L) {
-            return;
-        }
-
-        if (random.nextDouble() > getConfig().getDouble("combat.react-chance", 0.48)) {
-            return;
-        }
-
-        String reply = combatReply(profile, victim, bot.getHealth());
-
-        if (reply == null) return;
-
-        profile.lastCombatAt = now;
-        scheduleCombatReply(profile, reply, 1 + random.nextInt(5));
-    }
-
-    private String combatReply(BotProfile p, boolean victim, double health) {
-        boolean low = health <= 6.0;
-
-        if (victim && low) {
-            return choose(p, switch (p.style) {
-                case "dry" -> new String[]{"im low.", "not good"};
-                case "toxic" -> new String[]{"bro is actually sweating", "get off me for a second"};
-                case "brainrot" -> new String[]{"BRO IM ONE", "nah twin chill", "HELP"};
-                default -> new String[]{"yo chill", "im getting cooked", "bro relax", "im low"};
-            });
-        }
-
-        if (victim) {
-            return choose(p, switch (p.style) {
-                case "dry" -> new String[]{"ow", "really"};
-                case "toxic" -> new String[]{"that's all you got?", "you need that many hits?"};
-                case "brainrot" -> new String[]{"AYO", "nah", "bro jumped me"};
-                default -> new String[]{"yo", "bro", "watch it", "nah you got me"};
-            });
-        }
-
-        return choose(p, switch (p.style) {
-            case "dry" -> new String[]{"ok", "there"};
-            case "toxic" -> new String[]{"light work", "sit down", "you walked into that"};
-            case "brainrot" -> new String[]{"GET CLIPPED", "twin got sent", "nahhh"};
-            default -> new String[]{"got you", "nice", "hold that", "lets go"};
-        });
-    }
-
-    private void scheduleCombatReply(BotProfile profile, String reply, int delay) {
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            Player bot = Bukkit.getPlayerExact(profile.name);
-            if (bot == null || !bots.containsKey(key(profile.name))) return;
-
-            try {
-                bot.chat(sanitize(reply));
-                profile.lastSpokeAt = System.currentTimeMillis();
-                profile.remember(profile.name + ": " + reply);
-            } catch (Throwable error) {
-                getLogger().warning("Combat chat failed for " + profile.name);
-            }
-        }, delay);
-    }
-
-    @EventHandler
-    public void onDeath(PlayerDeathEvent event) {
-        BotProfile profile = bots.get(key(event.getEntity().getName()));
-
-        if (profile == null || random.nextDouble() > 0.85) return;
-
-        String reply = choose(profile, switch (profile.style) {
-            case "dry" -> new String[]{"bruh.", "unfortunate.", "lag. obviously."};
-            case "toxic" -> new String[]{"nah that was a scam death", "im getting that back", "you got lucky bro"};
-            case "supernice" -> new String[]{"gg, ill get it next time", "all good, happens"};
-            case "brainrot" -> new String[]{"BRO", "nahhh", "im actually sick"};
-            default -> new String[]{"BRO", "nahhh", "how did i die there", "run that back"};
-        });
-
-        scheduleCombatReply(profile, reply, 3);
-    }
-
-    // =========================================================
-    // BOT-TO-BOT CHAT
-    // =========================================================
-
-    private void maybeStartBotConversation() {
-        if (bots.size() < 2) return;
-
-        if (random.nextDouble() > getConfig().getDouble("social.bot-chat-chance", 0.035)) {
-            return;
-        }
-
-        List<BotProfile> online = new ArrayList<>();
-
-        for (BotProfile profile : bots.values()) {
-            if (Bukkit.getPlayerExact(profile.name) != null) {
-                online.add(profile);
-            }
-        }
-
-        if (online.size() < 2) return;
-
-        Collections.shuffle(online);
-
-        BotProfile first = online.get(0);
-        BotProfile second = online.get(1);
-
-        long now = System.currentTimeMillis();
-
-        if (now - first.lastSpokeAt < 20000L) return;
-        if (now - first.lastBotConversationAt < 90000L) return;
-
-        String opener = choose(first, switch (first.style) {
-            case "dry" -> new String[]{
-                    "you doing anything or just standing there",
-                    "this server is quiet",
-                    "what are you even building"
-            };
-            case "toxic" -> new String[]{
-                    second.name + " you still getting folded in pvp?",
-                    "you tryna fight or what"
-            };
-            case "brainrot" -> new String[]{
-                    "twin this server is NOT real",
-                    "gang what are we even doing rn",
-                    "nah this world is cooked"
-            };
-            case "supernice" -> new String[]{
-                    "yo " + second.name + ", how's your day going",
-                    "anyone need help with anything?"
-            };
-            default -> new String[]{
-                    "yo " + second.name + ", what you up to",
-                    "anyone wanna do something",
-                    "this server needs something to happen"
-            };
-        });
-
-        first.lastBotConversationAt = now;
-        scheduleReply(first, opener, 5 + random.nextInt(12));
-    }
-
-    private void processBotConversation(String speakerName, String message) {
-        String normalized = normalize(message);
-
-        for (BotProfile profile : bots.values()) {
-            if (profile.name.equalsIgnoreCase(speakerName)) continue;
-
-            Player bot = Bukkit.getPlayerExact(profile.name);
-            if (bot == null) continue;
-
-            boolean addressed = isAddressed(profile.name, normalized);
-
-            if (!addressed && random.nextDouble() > 0.12) continue;
-
             long now = System.currentTimeMillis();
 
-            if (now - profile.lastSpokeAt < 12000L) continue;
-            if (now - profile.lastBotConversationAt < 25000L) continue;
+            if (!flowState && now - data.lastSpoke < 800) return;
 
-            String reply = choose(profile, switch (profile.style) {
-                case "dry" -> new String[]{"yeah", "ok", "fair", "what"};
-                case "toxic" -> new String[]{"bro nobody asked", "you sure about that", "nah you're washed"};
-                case "brainrot" -> new String[]{"twin what", "HELP", "nah fr", "bro"};
-                case "supernice" -> new String[]{"yeah fr", "that's actually cool", "what are you guys doing?"};
-                default -> new String[]{"fr", "LMAO", "what do you mean", "yeah probably", "nah thats crazy"};
-            });
+            String finalReply = avoidRepeat(data, reply);
+            if (finalReply == null) return;
 
-            profile.lastBotConversationAt = now;
-            scheduleReply(profile, reply, 3 + random.nextInt(8));
-            break;
-        }
-    }
+            data.lastSpoke = now;
+            data.recentPhrases.addLast(finalReply.toLowerCase(Locale.ROOT));
 
-    // =========================================================
-    // RESOURCE / INVENTORY HELPERS
-    // =========================================================
-
-    private boolean asksForResource(String msg) {
-        return contains(
-                msg,
-                "anyone got", "anyone have", "does anyone have",
-                "who has", "need some", "need a", "can i get",
-                "can someone give", "got any", "have any",
-                "looking for"
-        );
-    }
-
-    private String requestedMaterial(String msg) {
-        String[][] aliases = {
-                {"wood", "OAK_LOG"},
-                {"logs", "OAK_LOG"},
-                {"planks", "OAK_PLANKS"},
-                {"cobble", "COBBLESTONE"},
-                {"cobblestone", "COBBLESTONE"},
-                {"stone", "STONE"},
-                {"dirt", "DIRT"},
-                {"sand", "SAND"},
-                {"glass", "GLASS"},
-                {"iron", "IRON_INGOT"},
-                {"diamonds", "DIAMOND"},
-                {"diamond", "DIAMOND"},
-                {"gold", "GOLD_INGOT"},
-                {"emeralds", "EMERALD"},
-                {"emerald", "EMERALD"},
-                {"obsidian", "OBSIDIAN"},
-                {"food", "COOKED_BEEF"},
-                {"bread", "BREAD"},
-                {"arrows", "ARROW"},
-                {"ender pearls", "ENDER_PEARL"},
-                {"ender pearl", "ENDER_PEARL"},
-                {"totems", "TOTEM_OF_UNDYING"},
-                {"totem", "TOTEM_OF_UNDYING"},
-                {"gapples", "GOLDEN_APPLE"},
-                {"golden apple", "GOLDEN_APPLE"},
-                {"netherite", "NETHERITE_INGOT"}
-        };
-
-        for (String[] alias : aliases) {
-            if (msg.contains(alias[0])) return alias[1];
-        }
-
-        return null;
-    }
-
-    private boolean hasMaterial(Player player, String materialName) {
-        return countMaterial(player, materialName) > 0;
-    }
-
-    private int countMaterial(Player player, String materialName) {
-        Material material = Material.matchMaterial(materialName);
-
-        if (material == null) return 0;
-
-        int amount = 0;
-
-        for (ItemStack item : player.getInventory().getStorageContents()) {
-            if (item != null && item.getType() == material) {
-                amount += item.getAmount();
+            while (data.recentPhrases.size() > 45) {
+                data.recentPhrases.removeFirst();
             }
+
+            bot.chat(finalReply);
+
+        }, delay);
+
+        pendingReplies.put(bot.getUniqueId(), task);
+    }
+
+    private boolean isAddressed(String message, String name) {
+        String text = normalize(message);
+        String username = normalize(name);
+
+        if (username.isEmpty()) return false;
+        if (text.contains(username)) return true;
+
+        // Recognize shortened names and recognizable name fragments.
+        Set<String> fragments = new HashSet<>();
+
+        if (username.length() >= 4) {
+            fragments.add(username.substring(0, 4));
+            fragments.add(username.substring(0, Math.min(5, username.length())));
+            fragments.add(username.substring(username.length() - 4));
+            fragments.add(username.substring(username.length() - 3));
+        } else {
+            fragments.add(username);
         }
 
-        return amount;
-    }
-
-    // =========================================================
-    // DETECTION HELPERS
-    // =========================================================
-
-    private boolean isAddressed(String botName, String message) {
-        String name = normalize(botName);
-
-        return message.matches(".*\\b" + Pattern.quote(name) + "\\b.*")
-                || message.startsWith("@" + name);
-    }
-
-    private boolean isGreeting(String msg) {
-        return msg.matches(
-                "^(yo+|hey+|hi+|hello+|sup|wsp|what'?s up|good morning|good evening)(\\s+.*)?$"
-        );
-    }
-
-    private boolean isHowAreYou(String msg) {
-        return contains(msg,
-                "how are you", "how you doing",
-                "you good", "hru", "wyd"
-        );
-    }
-
-    private boolean isInsult(String msg) {
-        return contains(msg,
-                "you suck", "you're trash", "ur trash",
-                "stupid", "idiot", "washed", "ez"
-        );
-    }
-
-    private boolean isFunny(String msg) {
-        return contains(msg,
-                "why did", "knock knock", "ligma",
-                "deez", "lmao", "lmfao",
-                "haha", "hahaha", "ayoo"
-        );
-    }
-
-    private boolean isMinecraftQuestion(String msg) {
-        return contains(msg,
-                "minecraft", "craft", "diamond",
-                "netherite", "warden", "wither",
-                "ender dragon", "elytra", "redstone",
-                "enchant", "pvp", "crystal",
-                "mace", "totem", "farm",
-                "villager", "coords"
-        );
-    }
-
-    private boolean isOpinionQuestion(String msg) {
-        return contains(msg,
-                "what do you think", "your opinion",
-                "who is better", "which is better",
-                "do you like", "favorite", "favourite",
-                "naruto", "anime", "football",
-                "soccer", "basketball", "nba"
-        );
-    }
-
-    private boolean isFunnyMessage(String msg) {
-        return contains(msg,
-                "bro what", "nahhh", "no way",
-                "what the", "lmao", "lmfao",
-                "hahaha", "ayo"
-        );
-    }
-
-    private boolean asksForCoordinates(String msg) {
-        return contains(msg,
-                "your coords", "your coordinates",
-                "where are you", "where u at",
-                "where you at", "send coords",
-                "drop coords"
-        );
-    }
-
-    private boolean offersHelp(String msg) {
-        return contains(msg,
-                "i can help", "ill help", "i'll help",
-                "coming to help", "where do you need",
-                "need help"
-        );
-    }
-
-    private boolean asksName(String msg) {
-        return contains(msg,
-                "who are you", "whats your name",
-                "what is your name"
-        );
-    }
-
-    // =========================================================
-    // GENERAL HELPERS
-    // =========================================================
-
-    private String choose(BotProfile profile, String[] options) {
-        if (options.length == 1) return options[0];
-
-        String previous = profile.lastPhrase;
-
-        for (int i = 0; i < 8; i++) {
-            String candidate = options[random.nextInt(options.length)];
-
-            if (!candidate.equalsIgnoreCase(previous)) {
-                profile.lastPhrase = candidate;
-                return candidate;
+        for (String fragment : fragments) {
+            if (fragment.length() >= 3 &&
+                    text.matches(".*\\b" + java.util.regex.Pattern.quote(fragment) + "\\b.*")) {
+                return true;
             }
-        }
-
-        return options[random.nextInt(options.length)];
-    }
-
-    private String coordinates(Player player) {
-        return player.getLocation().getBlockX() + " "
-                + player.getLocation().getBlockY() + " "
-                + player.getLocation().getBlockZ();
-    }
-
-    private String pretty(String material) {
-        return material.toLowerCase(Locale.ROOT).replace('_', ' ');
-    }
-
-    private String normalize(String input) {
-        return input.toLowerCase(Locale.ROOT)
-                .replaceAll("[^a-z0-9@'!? ]", " ")
-                .replaceAll("\\s+", " ")
-                .trim();
-    }
-
-    private String sanitize(String input) {
-        if (input == null) return "";
-
-        return input.replaceAll("[\\r\\n]+", " ")
-                .replaceAll("[\\p{Cntrl}]", "")
-                .trim();
-    }
-
-    private boolean contains(String text, String... phrases) {
-        for (String phrase : phrases) {
-            if (text.contains(phrase)) return true;
         }
 
         return false;
     }
 
-    private String key(String name) {
-        return name.toLowerCase(Locale.ROOT);
-    }
+    private String generateReply(
+            Player bot,
+            Player target,
+            String message,
+            BotData data,
+            boolean direct
+    ) {
+        String text = message.toLowerCase(Locale.ROOT);
+        String style = data.style;
 
-    private boolean isBot(String name) {
-        return bots.containsKey(key(name));
-    }
-
-    private Player asBot(Entity entity) {
-        if (!(entity instanceof Player player)) return null;
-
-        return isBot(player.getName()) ? player : null;
-    }
-
-    private void saveProfiles() {
-        getConfig().set("registered-bots", null);
-
-        for (BotProfile profile : bots.values()) {
-            getConfig().set(
-                    "registered-bots." + profile.name,
-                    profile.style
+        if (containsAny(text, "not you", "not talking to you",
+                "not you bro", "not you twin", "not talking about you")) {
+            return pick(
+                    "oh mb",
+                    "my fault twin",
+                    "damn i thought you meant me",
+                    "aight carry on",
+                    "mb gang i wasnt listening",
+                    "oh thats my bad",
+                    "nvm then",
+                    "i'll mind my business",
+                    "my fault bro",
+                    "aight i gotchu"
             );
         }
 
-        saveConfig();
+        if (containsAny(text, "stfu", "shut up", "shut yo",
+                "shut your mouth", "shut it")) {
+            if (style.equals("supernice")) {
+                return pick("damn okay", "my bad bro", "alright i'll chill",
+                        "sorry twin", "okay okay");
+            }
+
+            if (style.equals("dry")) {
+                return pick("ok", "damn", "alright", "whatever",
+                        "you done?");
+            }
+
+            return pick(
+                    "stfu twink",
+                    "damn what did i do",
+                    "bro woke up angry",
+                    "you good twin",
+                    "okay my fault gang",
+                    "who hurt you",
+                    "relaxxxx",
+                    "bro is NOT happy",
+                    "why you so mad",
+                    "alright bro damn",
+                    "you got it",
+                    "i literally did nothing",
+                    "damn chill",
+                    "bro pressed for what",
+                    "be nice to me twin",
+                    "what is your problem",
+                    "you woke up and chose violence",
+                    "okay boss",
+                    "my fault og",
+                    "damn bro"
+            );
+        }
+
+        if (containsAny(text, "hello", "hey", "yo", "wsp",
+                "sup", "wassup", "what's up", "whats up")) {
+            return greeting(style);
+        }
+
+        if (containsAny(text, "how are you", "how r u", "wyd", "what are you doing")) {
+            return pick(
+                    "chilling rn",
+                    "not much honestly",
+                    "just existing",
+                    "trying not to die",
+                    "standing around",
+                    "nothing crazy wbu",
+                    "im good bro",
+                    "just vibing",
+                    "looking for something to do",
+                    "bored as hell"
+            );
+        }
+
+        if (containsAny(text, "lol", "lmao", "lmfao", "haha", "help")) {
+            return pick(
+                    "LMAOO",
+                    "bro what",
+                    "nah thats crazy",
+                    "HELP",
+                    "im crying",
+                    "you are not serious",
+                    "LMFAOOO",
+                    "bro please",
+                    "thats actually funny",
+                    "nahhh"
+            );
+        }
+
+        if (containsAny(text, "are we", "toon force", "mog", "mogging")) {
+            return pick(
+                    "are we really doing this",
+                    "bro thinks hes him",
+                    "toon force is crazy",
+                    "we are NOT that guy",
+                    "nah we are finished",
+                    "are we nex right now",
+                    "bro is in his prime",
+                    "thats actually insane",
+                    "you cannot be serious",
+                    "twin is ascending"
+            );
+        }
+
+        if (containsAny(text, "where are you", "coords", "coordinates",
+                "where u at", "where you at")) {
+            Location loc = bot.getLocation();
+            return "im at " + loc.getBlockX() + " " +
+                    loc.getBlockY() + " " + loc.getBlockZ();
+        }
+
+        if (containsAny(text, "anyone have", "anyone got",
+                "does anyone have", "who has", "who got")) {
+            String resource = requestedMaterial(text);
+
+            if (resource != null) {
+                Material material = Material.matchMaterial(resource);
+
+                if (material != null && bot.getInventory().contains(material)) {
+                    return pick(
+                            "i got some",
+                            "yeah i have that",
+                            "i got a bit",
+                            "i can give you some",
+                            "how much you need"
+                    );
+                }
+
+                return pick(
+                        "i dont have any rn",
+                        "nah im broke",
+                        "i need that too",
+                        "wish i had some",
+                        "not me bro",
+                        "im looking for that too"
+                );
+            }
+
+            return pick(
+                    "what do you need",
+                    "what item",
+                    "depends what you need",
+                    "i might have it",
+                    "what are you looking for"
+            );
+        }
+
+        if (containsAny(text, "thank you", "thanks", "ty", "thx")) {
+            return pick("np", "no problem", "gotchu", "all good",
+                    "anytime twin", "dont mention it");
+        }
+
+        if (containsAny(text, "sorry", "my bad", "mb")) {
+            return pick("you good", "all good bro", "dw about it",
+                    "its fine", "no worries", "fairs");
+        }
+
+        if (containsAny(text, "anime", "naruto", "sasuke", "one piece",
+                "gojo", "jujutsu", "anime")) {
+            return pick(
+                    "naruto was actually peak",
+                    "bro sasuke was doing too much",
+                    "gojo fans are never beating the allegations",
+                    "that arc was crazy",
+                    "i need to watch that",
+                    "nah that character is cold",
+                    "anime debates never end",
+                    "bro just put me on"
+            );
+        }
+
+        if (containsAny(text, "fight", "pvp", "combo", "crystal",
+                "totem", "mace", "sword", "axe")) {
+            return pick(
+                    "pvp is actually fun when you arent getting jumped",
+                    "bro just dont get comboed",
+                    "im not losing my gear today",
+                    "that was a clean fight",
+                    "nah i would win",
+                    "we need a rematch",
+                    "bro got folded",
+                    "im staying out of that"
+            );
+        }
+
+        if (containsAny(text, "what", "why", "how", "who", "when",
+                "where", "do you", "are you", "can you")) {
+            return questionReply(text, style);
+        }
+
+        if (style.equals("dry")) {
+            return pick("yeah", "nah", "maybe", "idk",
+                    "fairs", "real", "ok", "true", "sure", "probably");
+        }
+
+        if (style.equals("supernice")) {
+            return pick(
+                    "yeah of course",
+                    "thats fair honestly",
+                    "i get what you mean",
+                    "you good bro",
+                    "im listening",
+                    "thats actually nice",
+                    "yeah im down",
+                    "good point twin"
+            );
+        }
+
+        if (style.equals("toxic")) {
+            return pick(
+                    "bro what are you talking about",
+                    "you sure about that",
+                    "thats a crazy take",
+                    "nah you are finished",
+                    "keep talking",
+                    "you got it lil bro",
+                    "thats embarrassing",
+                    "bro is yapping"
+            );
+        }
+
+        if (style.equals("sus")) {
+            return pick(
+                    "ayo why you say it like that",
+                    "pause",
+                    "bro what",
+                    "thats kinda crazy",
+                    "you didnt have to say all that",
+                    "sus behavior",
+                    "im watching you",
+                    "AYO"
+            );
+        }
+
+        if (style.equals("brainrot")) {
+            return pick(
+                    "twin is NOT cooking",
+                    "bro is actually cooked",
+                    "nah thats wild",
+                    "we got a yapper",
+                    "absolute cinema",
+                    "bro has negative aura",
+                    "this is not real",
+                    "im crying",
+                    "chat is this real",
+                    "nah gang"
+            );
+        }
+
+        return pick(
+                "fairs",
+                "real",
+                "nah fr",
+                "i get you",
+                "thats crazy",
+                "what you mean",
+                "bro honestly",
+                "true twin",
+                "im listening",
+                "say that again",
+                "wait what",
+                "you might be right",
+                "nah thats fair",
+                "interesting",
+                "im not even gonna lie",
+                "thats actually wild",
+                "i see what you mean",
+                "bro has a point",
+                "no way",
+                "you serious?"
+        );
     }
 
-    // =========================================================
-    // DATA CLASSES
-    // =========================================================
-
-    private static final class Decision {
-        final String message;
-        final int delay;
-
-        Decision(String message, int delay) {
-            this.message = message;
-            this.delay = delay;
+    private String questionReply(String text, String style) {
+        if (containsAny(text, "do you like", "you like")) {
+            return pick(
+                    "depends honestly",
+                    "yeah its pretty good",
+                    "not really",
+                    "i dont mind it",
+                    "yeah im into that",
+                    "nah not my thing",
+                    "sometimes"
+            );
         }
+
+        if (containsAny(text, "are you real", "are you a bot")) {
+            return pick(
+                    "bro what",
+                    "im literally standing here",
+                    "you tell me",
+                    "thats a crazy accusation",
+                    "nah im just chilling",
+                    "why would you ask me that"
+            );
+        }
+
+        if (containsAny(text, "why")) {
+            return pick(
+                    "because why not",
+                    "idk honestly",
+                    "thats what im saying",
+                    "good question",
+                    "dont ask me bro",
+                    "i was wondering the same thing"
+            );
+        }
+
+        return pick(
+                "idk what do you think",
+                "maybe",
+                "what do you mean exactly",
+                "honestly no idea",
+                "depends",
+                "probably",
+                "thats a good question",
+                "you tell me",
+                "i was thinking the same thing"
+        );
     }
 
-    private static final class BotProfile {
-        final String name;
-
-        volatile String style;
-
-        final Deque<String> history = new ArrayDeque<>();
-
-        String lastPhrase = "";
-        long lastSpokeAt;
-        long lastCombatAt;
-        long lastBotConversationAt;
-
-        BotProfile(String name, String style) {
-            this.name = name;
-            this.style = style;
+    private String greeting(String style) {
+        if (style.equals("dry")) {
+            return pick("yo", "wsp", "sup", "hey", "what");
         }
 
-        void remember(String message) {
-            history.addLast(message);
+        return pick(
+                "yo",
+                "wsp twin",
+                "ay whats good",
+                "sup bro",
+                "yo gang",
+                "what's up",
+                "wsp",
+                "hey",
+                "who called me",
+                "what you need",
+                "ayyy",
+                "yo yo",
+                "whats happening",
+                "what we doing",
+                "im here",
+                "wassup",
+                "what's good",
+                "how we doing",
+                "yo twin",
+                "ay bro"
+        );
+    }
 
-            while (history.size() > 18) {
-                history.removeFirst();
+    private String avoidRepeat(BotData data, String reply) {
+        if (!data.recentPhrases.contains(reply.toLowerCase(Locale.ROOT))) {
+            return reply;
+        }
+
+        // Rebuild a variation instead of repeating an exact line.
+        for (int i = 0; i < 12; i++) {
+            String alternative = pick(
+                    "nah fr",
+                    "fairs honestly",
+                    "bro what",
+                    "you get me",
+                    "im saying",
+                    "thats crazy",
+                    "real",
+                    "i hear you",
+                    "no way",
+                    "thats fair",
+                    "you serious",
+                    "im not even joking",
+                    "wait actually",
+                    "lowkey true",
+                    "nah thats wild",
+                    "i get it",
+                    "exactly",
+                    "thats what im saying",
+                    "you know what i mean",
+                    "bro honestly"
+            );
+
+            if (!data.recentPhrases.contains(alternative.toLowerCase(Locale.ROOT))) {
+                return alternative;
             }
         }
+
+        return null;
+    }
+
+    private void ambientTick() {
+        long now = System.currentTimeMillis();
+
+        for (Map.Entry<UUID, BotData> entry : bots.entrySet()) {
+            Player bot = Bukkit.getPlayer(entry.getKey());
+            BotData data = entry.getValue();
+
+            if (bot == null || !bot.isOnline()) continue;
+            if (isCombat(bot)) continue;
+
+            // Occasionally notice players at 50–100 blocks.
+            if (now - lastSpotMessage.getOrDefault(bot.getUniqueId(), 0L) > 60000) {
+                for (Player nearby : Bukkit.getOnlinePlayers()) {
+                    if (nearby.equals(bot) || bots.containsKey(nearby.getUniqueId())) continue;
+
+                    double distance = bot.getLocation().distanceSquared(nearby.getLocation());
+
+                    if (distance > 2500 && distance <= 10000 &&
+                            bot.hasLineOfSight(nearby) && random.nextInt(100) < 7) {
+
+                        String mock = mockName(nearby.getName());
+
+                        String line = pick(
+                                "i can see you " + nearby.getName(),
+                                "bro i see you over there " + nearby.getName(),
+                                "you thought you were sneaky " + nearby.getName(),
+                                "are we " + mock + " right now",
+                                mock + " behavior",
+                                "yo " + nearby.getName() + " i see you"
+                        );
+
+                        bot.chat(line);
+                        lastSpotMessage.put(bot.getUniqueId(), now);
+                        break;
+                    }
+                }
+            }
+
+            // Occasional TPA requests to random players.
+            if (now - data.lastSpoke > 120000 && random.nextInt(100) < 3) {
+                requestRandomTeleport(bot, data);
+            }
+        }
+    }
+
+    private void requestRandomTeleport(Player bot, BotData data) {
+        List<Player> candidates = new ArrayList<>();
+
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (player.equals(bot)) continue;
+            if (bots.containsKey(player.getUniqueId())) continue;
+            candidates.add(player);
+        }
+
+        if (candidates.isEmpty()) return;
+
+        Player target = candidates.get(random.nextInt(candidates.size()));
+
+        String message = pick(
+                "yo can i tp",
+                "can i chill with you",
+                "accept twin",
+                "accept bro",
+                "accept twinny",
+                "lemme come over",
+                "yo send the accept",
+                "trust accept",
+                "can i come to you",
+                "im bored can i tp",
+                "let me join you",
+                "accept sahur",
+                "yo can i come chill",
+                "lemme pull up",
+                "can i teleport over",
+                "accept the request",
+                "im tryna chill with you",
+                "send that tp",
+                "yo let me come over",
+                "accept gang"
+        );
+
+        bot.chat(message);
+
+        // Execute as the bot player, not as console.
+        Bukkit.dispatchCommand(bot, "tpa " + target.getName());
+
+        data.lastSpoke = System.currentTimeMillis();
+    }
+
+    private String mockName(String name) {
+        if (name.length() <= 3) return name;
+
+        String lower = name.toLowerCase(Locale.ROOT);
+
+        if (lower.length() >= 6) {
+            return lower.substring(lower.length() - 3);
+        }
+
+        return lower.substring(0, Math.min(4, lower.length()));
+    }
+
+    private boolean isCombat(Player player) {
+        return combatUntil.getOrDefault(player.getUniqueId(), 0L)
+                > System.currentTimeMillis();
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDamage(EntityDamageByEntityEvent event) {
+        Player victim = event.getEntity() instanceof Player p ? p : null;
+
+        Player attacker = null;
+
+        if (event.getDamager() instanceof Player p) {
+            attacker = p;
+        } else if (event.getDamager() instanceof org.bukkit.entity.Projectile projectile
+                && projectile.getShooter() instanceof Player p) {
+            attacker = p;
+        }
+
+        long until = System.currentTimeMillis() + 12000;
+
+        if (victim != null && bots.containsKey(victim.getUniqueId())) {
+            combatUntil.put(victim.getUniqueId(), until);
+
+            if (random.nextInt(100) < 65) {
+                String reply = combatPhrase(true);
+                if (random.nextBoolean()) reply = panicTyping(reply);
+
+                BotData data = bots.get(victim.getUniqueId());
+                Player target = attacker;
+
+                if (target != null) {
+                    scheduleReply(victim, target, data, reply, false);
+                } else {
+                    victim.chat(reply);
+                }
+            }
+        }
+
+        if (attacker != null && bots.containsKey(attacker.getUniqueId())) {
+            combatUntil.put(attacker.getUniqueId(), until);
+
+            if (victim != null && random.nextInt(100) < 35) {
+                String reply = combatPhrase(false);
+                if (random.nextBoolean()) reply = panicTyping(reply);
+
+                attacker.chat(reply);
+            }
+        }
+    }
+
+    @EventHandler
+    public void onDeath(PlayerDeathEvent event) {
+        Player player = event.getEntity();
+
+        if (!bots.containsKey(player.getUniqueId())) return;
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline()) return;
+
+            player.chat(pick(
+                    "BRO",
+                    "nah thats crazy",
+                    "im actually finished",
+                    "who jumped me",
+                    "im never recovering",
+                    "that was embarrassing",
+                    "im getting my stuff back",
+                    "nah run that back",
+                    "I GOT FOLDED",
+                    "bro where was my teammate"
+            ));
+        }, 20L);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+
+        if (getConfig().contains("bots." + player.getUniqueId())) {
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (!player.isOnline()) return;
+                loadBots();
+            }, 20L);
+        }
+    }
+
+    private String combatPhrase(boolean beingHit) {
+        if (beingHit) {
+            return pick(
+                    "BRO IM GETTING COMBOED",
+                    "HELP HELP",
+                    "nah im low",
+                    "BRO GET OFF ME",
+                    "IM ACTUALLY COOKED",
+                    "WHERE IS MY TEAM",
+                    "WAIT WAIT",
+                    "IM GETTING JUMPED",
+                    "BRO CHILL",
+                    "I NEED HELP",
+                    "nah this is bad",
+                    "IM RUNNING",
+                    "BRO WHAT",
+                    "GET ME OUT",
+                    "im so dead"
+            );
+        }
+
+        return pick(
+                "get comboed",
+                "nah you are finished",
+                "bro cannot move",
+                "that was clean",
+                "stay there",
+                "you are not escaping",
+                "free combo",
+                "bro got caught",
+                "nah run",
+                "too easy",
+                "im on you",
+                "you are cooked",
+                "hold that",
+                "get back here",
+                "no way you survived that"
+        );
+    }
+
+    private String panicTyping(String message) {
+        return switch (random.nextInt(6)) {
+            case 0 -> message.replace("BRO", "BROO");
+            case 1 -> message.replace("HELP", "HELPP");
+            case 2 -> message.replace("IM", "IMMM");
+            case 3 -> message.replace("WAIT", "WAIIT");
+            case 4 -> message.replace("GET", "GE T");
+            default -> message + " BRO";
+        };
+    }
+
+    private String requestedMaterial(String text) {
+        if (containsAny(text, "wood", "logs", "planks")) return "OAK_LOG";
+        if (containsAny(text, "iron")) return "IRON_INGOT";
+        if (containsAny(text, "diamonds", "diamond")) return "DIAMOND";
+        if (containsAny(text, "food", "bread")) return "BREAD";
+        if (containsAny(text, "cobble", "cobblestone")) return "COBBLESTONE";
+        if (containsAny(text, "gold")) return "GOLD_INGOT";
+        if (containsAny(text, "arrows", "arrow")) return "ARROW";
+        if (containsAny(text, "ender pearl", "pearls")) return "ENDER_PEARL";
+        return null;
+    }
+
+    private boolean containsAny(String text, String... words) {
+        for (String word : words) {
+            if (text.contains(word)) return true;
+        }
+        return false;
+    }
+
+    private String normalize(String text) {
+        return text.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9 ]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private String pick(String... choices) {
+        return choices[random.nextInt(choices.length)];
+    }
+
+    private long randomBetween(long min, long max) {
+        return min + random.nextLong(max - min + 1);
     }
 }
